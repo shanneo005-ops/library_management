@@ -1,6 +1,5 @@
 
 import calendar
-import itertools
 import re
 import secrets
 import socket
@@ -37,16 +36,35 @@ def db():
     con.create_function("contains", 2, _contains)
     return con
 
+REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    token      TEXT NOT NULL UNIQUE,
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending / borrowed / returned / declined
+    book_id    INTEGER NOT NULL REFERENCES books(id),
+    name       TEXT NOT NULL,
+    student_id TEXT NOT NULL,
+    section    TEXT NOT NULL,
+    course     TEXT NOT NULL,
+    year       TEXT NOT NULL,
+    contact    TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    date       TEXT NOT NULL,                      -- ISO date borrowed
+    due        TEXT NOT NULL                       -- ISO date to return
+)
+"""
+
 def init_db():
-    """Create library.db from books_sqlite.sql if it does not exist yet."""
-    if BOOKS_DB.exists():
-        return
-    if not BOOKS_SQL.exists():
-        raise SystemExit("library.db and books_sqlite.sql are both missing - keep them next to this file.")
-    con = sqlite3.connect(BOOKS_DB)
-    con.executescript(BOOKS_SQL.read_text(encoding="utf-8"))
-    con.commit()
-    con.close()
+    """Create library.db from books_sqlite.sql if missing, and make sure the requests table exists."""
+    if not BOOKS_DB.exists():
+        if not BOOKS_SQL.exists():
+            raise SystemExit("library.db and books_sqlite.sql are both missing - keep them next to this file.")
+        con = sqlite3.connect(BOOKS_DB)
+        con.executescript(BOOKS_SQL.read_text(encoding="utf-8"))
+        con.commit()
+        con.close()
+    with db() as con:
+        con.execute(REQUESTS_TABLE)
 
 def all_books():
     with db() as con:
@@ -65,8 +83,7 @@ init_db()
 YEAR_LEVELS = ["1st Year", "2nd Year", "3rd Year", "4th Year"]
 FORM_FIELDS = ["name", "student_id", "section", "course", "year", "contact", "email", "date"]
 
-requests_db = []                                                                                   
-_ids = itertools.count(1)
+# Borrow requests are stored in the "requests" table of library.db (see init_db).
 
                                                                           
 def add_one_month(d):
@@ -93,31 +110,58 @@ def duration_info(r):
     return {"label": f"{plural_days(left)} left", "state": "soon" if left <= 3 else "ok",
             "pct": pct, "left": left}
 
-def add_request(book, info, status="pending"):
-    r = {
-        "id": next(_ids),
-        "token": secrets.token_urlsafe(9),                             
-        "status": status,
-        "book_id": book["id"],
-        "book": book["title"],
-        "name": info["name"],
-        "student_id": info["student_id"],
-        "section": info["section"],
-        "course": info["course"],
-        "year": info["year"],
-        "contact": info["contact"],
-        "email": info["email"],
-        "date": info["date"],                                                           
-        "due": add_one_month(info["date"]),                         
-    }
-    requests_db.append(r)
+def _to_req(row):
+    """DB row -> dict with real date objects and the book title."""
+    if row is None:
+        return None
+    r = dict(row)
+    r["date"] = date.fromisoformat(r["date"])
+    r["due"] = date.fromisoformat(r["due"])
     return r
+
+_REQ_SELECT = ("SELECT r.*, b.title AS book FROM requests r "
+               "JOIN books b ON b.id = r.book_id ")
+
+def list_requests(status):
+    with db() as con:
+        rows = con.execute(_REQ_SELECT + "WHERE r.status = ? ORDER BY r.id", (status,)).fetchall()
+    return [_to_req(x) for x in rows]
+
+def get_request(req_id):
+    with db() as con:
+        return _to_req(con.execute(_REQ_SELECT + "WHERE r.id = ?", (req_id,)).fetchone())
+
+def get_request_by_token(token):
+    with db() as con:
+        return _to_req(con.execute(_REQ_SELECT + "WHERE r.token = ?", (token,)).fetchone())
+
+def set_status(req_id, status):
+    with db() as con:
+        con.execute("UPDATE requests SET status = ? WHERE id = ?", (status, req_id))
+
+def count_pending():
+    with db() as con:
+        return con.execute("SELECT COUNT(*) AS n FROM requests WHERE status = 'pending'").fetchone()["n"]
+
+def add_request(book, info, status="pending"):
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO requests (token, status, book_id, name, student_id, section, course, year,"
+            " contact, email, date, due) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (secrets.token_urlsafe(9), status, book["id"], info["name"], info["student_id"],
+             info["section"], info["course"], info["year"], info["contact"], info["email"],
+             info["date"].isoformat(), add_one_month(info["date"]).isoformat()))
+        new_id = cur.lastrowid
+    return get_request(new_id)
 
 def book_by_title(title):
     with db() as con:
         return con.execute("SELECT id, title FROM books WHERE title = ?", (title,)).fetchone()
 
 def seed_demo_data():
+    with db() as con:
+        if con.execute("SELECT COUNT(*) AS n FROM requests").fetchone()["n"]:
+            return                      # already has data - don't duplicate on every restart
     t = date.today()
 
     pending = [
@@ -213,7 +257,7 @@ def fmt_long(d):
 
 @app.context_processor
 def inject_counts():
-    return {"pending_count": sum(1 for r in requests_db if r["status"] == "pending")}
+    return {"pending_count": count_pending()}
 
                                                                             
 CSS = """
@@ -603,7 +647,7 @@ def admin_login():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    borrowed = [dict(r, **duration_info(r)) for r in requests_db if r["status"] == "borrowed"]
+    borrowed = [dict(r, **duration_info(r)) for r in list_requests("borrowed")]
     borrowed.sort(key=lambda r: r["due"])                                        
     overdue = sum(1 for r in borrowed if r["state"] == "over")
     return render_template("dashboard.html", title="Dashboard", active="dashboard",
@@ -612,7 +656,7 @@ def dashboard():
 @app.route("/borrow-requests")
 @login_required
 def borrow_requests_page():
-    pending = [r for r in requests_db if r["status"] == "pending"]
+    pending = list_requests("pending")
     return render_template("requests.html", title="Borrow Requests", active="requests",
                            pending=pending)
 
@@ -628,20 +672,20 @@ def qr_code_page():
 @app.route("/requests/<int:req_id>/<action>", methods=["POST"])
 @login_required
 def handle_request(req_id, action):
-    r = next((x for x in requests_db if x["id"] == req_id), None)
+    r = get_request(req_id)
     if r is None or action not in ("accept", "decline", "return"):
         abort(404)
     needed = "borrowed" if action == "return" else "pending"
     if r["status"] != needed:
         flash("That request was already handled.")
     elif action == "accept":
-        r["status"] = "borrowed"
+        set_status(req_id, "borrowed")
         flash(f"Accepted {r['name']}'s request for {r['book']}. Return by {r['due']:%m - %d - %Y}.")
     elif action == "decline":
-        r["status"] = "declined"
+        set_status(req_id, "declined")
         flash(f"Declined {r['name']}'s request for {r['book']}.")
     else:
-        r["status"] = "returned"
+        set_status(req_id, "returned")
         flash(f"{r['book']} returned by {r['name']}.")
     return redirect(url_for("dashboard" if action == "return" else "borrow_requests_page"))
 
@@ -677,7 +721,7 @@ def member_request(book_id):
 
 @app.route("/member/receipt/<token>")
 def member_receipt(token):
-    r = next((x for x in requests_db if x["token"] == token), None)
+    r = get_request_by_token(token)
     if r is None:
         abort(404)
     return render_template("member_receipt.html", r=r)
